@@ -1,5 +1,17 @@
 from setuptools import setup, find_packages
 
+extras_require = {
+    'dev': [
+        'pytest>=6.0.0',
+        'pytest-cov>=2.0.0',
+        'flake8>=3.9.0',
+        'black>=21.0',
+        'mypy>=0.900',
+        'twine>=3.4.0',
+        'build>=0.7.0',
+    ],
+}
+
 setup(
     name="salesforce-spark-connector",
     version="0.1.0",
@@ -25,4 +37,5 @@ setup(
         "Programming Language :: Python :: 3.9",
     ],
     python_requires=">=3.7",
+    extras_require=extras_require,
 ) 
