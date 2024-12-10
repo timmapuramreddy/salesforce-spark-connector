@@ -16,13 +16,13 @@ def get_glue_spark_session(
         SparkSession: Configured Spark session
     """
     default_config = {
-        "spark.sql.broadcastTimeout": "3600",
-        "spark.sql.shuffle.partitions": "200",
-        "spark.default.parallelism": "100",
-        "spark.dynamicAllocation.enabled": "true",
-        "spark.dynamicAllocation.initialExecutors": "2",
-        "spark.dynamicAllocation.minExecutors": "2",
-        "spark.dynamicAllocation.maxExecutors": "10"
+        "spark.sql.broadcastTimeout": "3600",           # Timeout for broadcast joins (in seconds)
+        "spark.sql.shuffle.partitions": "200",          # Number of partitions for shuffling
+        "spark.default.parallelism": "100",             # Default number of parallel tasks
+        "spark.dynamicAllocation.enabled": "true",      # Enable dynamic allocation of executors
+        "spark.dynamicAllocation.initialExecutors": "2", # Initial number of executors
+        "spark.dynamicAllocation.minExecutors": "2",    # Minimum number of executors
+        "spark.dynamicAllocation.maxExecutors": "10"    # Maximum number of executors
     }
     
     if additional_config:
