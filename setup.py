@@ -20,9 +20,10 @@ setup(
     packages=find_packages(),
     install_requires=[
         "simple-salesforce~=1.12.0",
-        "pyspark~=3.0.0",
-        "typing-extensions~=4.0.0",
+        "pyspark~=3.4.0",
+        "typing-extensions~=4.6.0",
         "boto3~=1.26.0",
+        "requests-oauthlib~=1.3.0",
     ],
     extras_require=extras_require,
     author="Timmapuram Reddy",
@@ -40,5 +41,5 @@ setup(
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
     ],
-    python_requires=">=3.7",
+    python_requires=">=3.7,<3.12",
 ) 
