@@ -1,7 +1,8 @@
 from simple_salesforce import Salesforce
 from simple_salesforce.login import SalesforceLogin
 from requests_oauthlib import OAuth2Session
-from typing import Dict, Optional
+from typing import Dict, Optional, Union, List, TYPE_CHECKING, Any, TypeVar, Literal
+from pyspark.sql import DataFrame
 from .utils.logging_utils import setup_logging
 from .utils.spark_utils import initialize_spark
 from .cache.field_cache import FieldCache
@@ -17,252 +18,199 @@ from .utils.token_manager import TokenManager
 import jwt
 import requests
 import time
+import importlib
+from .config import SalesforceConfig, AWSConfig, ProcessingConfig
+
+
+# Conditional imports for type hints
+if TYPE_CHECKING:
+    from pyspark.sql import DataFrame as SparkDataFrame
+    from awsglue.dynamicframe import DynamicFrame
+    import duckdb
+
+T = TypeVar('T')
 
 class ScalableSalesforceConnector:
-    def __init__(self, 
-                 client_id: Optional[str] = None,
-                 client_secret: Optional[str] = None,
-                 username: Optional[str] = None,
-                 password: Optional[str] = None,
-                 security_token: Optional[str] = None,
-                 private_key: Optional[str] = None,
-                 private_key_path: Optional[str] = None,
-                 secret_name: Optional[str] = None,
-                 region_name: Optional[str] = None,
-                 redirect_uri: Optional[str] = None,
-                 auth_url: Optional[str] = None,
-                 token_url: Optional[str] = None,
-                 auth_method: str = 'oauth',
-                 secret_values: Optional[Dict] = None,
-                 spark_config: Optional[Dict[str, str]] = None,
-                 domain: str = 'login',
-                 version: str = '54.0',
-                 cache_size: int = 100,
-                 glue_context = None):
+    def __init__(self,
+                 sf_config: Optional[SalesforceConfig] = None,
+                 aws_config: Optional[AWSConfig] = None,
+                 processing_config: Optional[ProcessingConfig] = None):
         """
-        Initialize the Salesforce connector with either direct credentials or OAuth2.
+        Initialize the Salesforce connector with configuration objects.
         
         Args:
-            client_id: Salesforce client ID (for OAuth2)
-            client_secret: Salesforce client secret (for OAuth2)
-            username: Salesforce username (for direct credentials)
-            password: Salesforce password (for direct credentials)
-            security_token: Salesforce security token (for direct credentials)
-            secret_name: AWS Secrets Manager secret name/ARN (optional)
-            region_name: AWS region for Secrets Manager (optional)
-            redirect_uri: Redirect URI for OAuth2
-            auth_url: Authorization URL for OAuth2
-            token_url: Token URL for OAuth2
-            spark_config: Additional Spark configuration
-            domain: Salesforce domain
-            version: API version
-            cache_size: Size of the field type cache
-            glue_context: AWS Glue context (optional)
+            sf_config: Salesforce connection configuration
+            aws_config: AWS services configuration
+            processing_config: Data processing configuration
         """
+        # Initialize with default configs if not provided
+        self.sf_config = sf_config or SalesforceConfig()
+        self.aws_config = aws_config or AWSConfig()
+        self.proc_config = processing_config or ProcessingConfig()
         
         self.logger = setup_logging()
+        self.version = self.sf_config.version
+        self.sf = None  # Initialize sf as None first
         
         # Initialize Spark
-        if glue_context:
-            self.spark = get_glue_spark_session(glue_context, spark_config)
-        else:
-            self.spark = initialize_spark(spark_config)
-        
-        self.cache = FieldCache(cache_size)
-
-        # Handle direct secret values for all auth methods
-        if secret_values:
-            self.logger.info(f"Using provided secret values for {auth_method} authentication")
-            if auth_method == 'jwt_secret':
-                self._handle_jwt_secret_auth(secret_values)
-            elif auth_method == 'jwt_cert':
-                self._handle_jwt_cert_auth(
-                    secret_values.get('client_id'),
-                    secret_values.get('username'),
-                    secret_values.get('private_key'),
-                    secret_values.get('private_key_path')
-                )
-            elif auth_method == 'oauth':
-                # Initialize TokenManager with provided secrets
-                self.token_manager = TokenManager(
-                    client_id=secret_values.get('client_id'),
-                    client_secret=secret_values.get('client_secret'),
-                    token_url=secret_values.get('token_url')
-                )
-                if 'existing_token' in secret_values:
-                    self.token_manager.set_token(secret_values['existing_token'])
-                self._handle_oauth_pkce_auth(
-                    secret_values.get('client_id'),
-                    secret_values.get('client_secret'),
-                    secret_values.get('redirect_uri'),
-                    secret_values.get('auth_url'),
-                    secret_values.get('token_url')
-                )
-            elif auth_method == 'password':
-                self._handle_password_auth(
-                    secret_values.get('username'),
-                    secret_values.get('password'),
-                    secret_values.get('security_token'),
-                    secret_values.get('domain', 'login')
-                )
-            
-            self.extractor = DataExtractor(self.sf, self.spark, self.cache, self.logger)
-            self.loader = DataLoader(self.sf, self.logger)
-            return
-
-        # Initialize credentials from Secrets Manager if provided
-        if secret_name:
-            self.logger.info(f"Retrieving credentials from Secrets Manager: {secret_name}")
-            try:
-                secrets_manager = SecretsManager(region_name)
-                credentials = secrets_manager.get_secret(secret_name)
-                
-                # Handle JWT secret authentication if specified
-                if auth_method == 'jwt_secret':
-                    self._handle_jwt_secret_auth(credentials)
-                    self.extractor = DataExtractor(self.sf, self.spark, self.cache, self.logger)
-                    self.loader = DataLoader(self.sf, self.logger)
-                    return
+        self.spark = None
+        try:
+            if self.proc_config.require_spark or self.proc_config.glue_context:
+                if self.proc_config.glue_context:
+                    self.spark = get_glue_spark_session(
+                        self.proc_config.glue_context,
+                        self.proc_config.spark_config
+                    )
+                else:
+                    self.spark = initialize_spark(self.proc_config.spark_config)
                     
-                # Otherwise, proceed with existing secret handling
-                client_id = credentials.get('salesforce_client_id', client_id)
-                client_secret = credentials.get('salesforce_client_secret', client_secret)
-                username = credentials.get('salesforce_username', username)
-                password = credentials.get('salesforce_password', password)
-                security_token = credentials.get('salesforce_security_token', security_token)
+                if self.spark is None and self.proc_config.require_spark:
+                    raise Exception("Failed to initialize Spark session")
+                    
+        except Exception as e:
+            self.logger.warning(f"Spark initialization failed: {str(e)}")
+            if self.proc_config.require_spark:
+                raise
+            self.spark = None
+            
+        self.cache = FieldCache(self.proc_config.cache_size)
+
+        # Get credentials and initialize Salesforce connection
+        credentials = None
+        if self.aws_config.secret_name:
+            self.logger.info(f"Retrieving credentials from Secrets Manager: {self.aws_config.secret_name}")
+            try:
+                secrets_manager = SecretsManager(self.aws_config.region_name)
+                credentials = secrets_manager.get_secret(self.aws_config.secret_name)
             except Exception as e:
                 self.logger.error(f"Failed to retrieve credentials from Secrets Manager: {str(e)}")
                 raise
-
-        # Handle certificate-based JWT authentication
-        if auth_method == 'jwt_cert' and client_id and username:
-            # JWT tokens are short-lived and need to be regenerated rather than refreshed
-            # TokenManager is not used here because JWT auth generates a new token each time
-            # using the private key certificate, rather than refreshing an existing token
-            self._handle_jwt_cert_auth(client_id, username, private_key, private_key_path)
-            self.extractor = DataExtractor(self.sf, self.spark, self.cache, self.logger)
-            self.loader = DataLoader(self.sf, self.logger)
-            return
-
-        # Initialize TokenManager for OAuth2
-        if client_id and client_secret and token_url:
-            self.token_manager = TokenManager(
-                client_id=client_id,
-                client_secret=client_secret,
-                token_url=token_url
-            )
-            
-            # Try to reuse existing token
-            try:
-                token = self.token_manager.get_valid_token()
-                self.sf = Salesforce(
-                    instance_url=token['instance_url'],
-                    session_id=token['access_token'],
-                    version=version
+        elif self.aws_config.secret_values:
+            self.logger.info(f"Using provided secret values for {self.sf_config.auth_method} authentication")
+            credentials = self.aws_config.secret_values
+        
+        if credentials:
+            # Handle authentication based on method
+            if self.sf_config.auth_method == 'jwt_secret':
+                self._handle_jwt_secret_auth(credentials)
+            elif self.sf_config.auth_method == 'jwt_cert':
+                self._handle_jwt_cert_auth(
+                    credentials.get('client_id', self.sf_config.client_id),
+                    credentials.get('username', self.sf_config.username),
+                    credentials.get('private_key', self.sf_config.private_key),
+                    credentials.get('private_key_path', self.sf_config.private_key_path)
                 )
-                self.logger.info("Successfully connected using existing token")
-                self.extractor = DataExtractor(self.sf, self.spark, self.cache, self.logger)
-                self.loader = DataLoader(self.sf, self.logger)
-                return
-            except Exception as e:
-                self.logger.debug(f"Could not reuse token: {str(e)}")
-                # Continue with new authentication if we have all required parameters
-                if not all([redirect_uri, auth_url]):
-                    raise ValueError(
-                        "No valid token found and missing required OAuth2 parameters "
-                        "(redirect_uri, auth_url) for new authentication"
-                    )
-
-        # OAuth2 Authentication with PKCE
-        if client_id and client_secret and redirect_uri and auth_url and token_url:
-            self.logger.info("Using OAuth2 for authentication")
-            try:
-                # Proceed with new authentication
-                # Generate PKCE code verifier and challenge
-                code_verifier = secrets.token_urlsafe(96)
-                code_challenge = base64.urlsafe_b64encode(
-                    hashlib.sha256(code_verifier.encode('ascii')).digest()
-                ).rstrip(b'=').decode('ascii')
-
-                # Define scopes
-                scopes = ['api', 'refresh_token']  # Simplified scope list
-
-                oauth = OAuth2Session(
-                    client_id,
-                    redirect_uri=redirect_uri,
-                    scope=scopes
+            elif self.sf_config.auth_method == 'oauth':
+                self.token_manager = TokenManager(
+                    client_id=credentials.get('client_id', self.sf_config.client_id),
+                    client_secret=credentials.get('client_secret', self.sf_config.client_secret),
+                    token_url=credentials.get('token_url', self.sf_config.token_url)
                 )
-
-                # Add PKCE parameters
-                authorization_url, state = oauth.authorization_url(
-                    auth_url,
-                    code_challenge=code_challenge,
-                    code_challenge_method='S256'
+                if 'existing_token' in credentials:
+                    self.token_manager.set_token(credentials['existing_token'])
+                self._handle_oauth_pkce_auth(
+                    credentials.get('client_id', self.sf_config.client_id),
+                    credentials.get('client_secret', self.sf_config.client_secret),
+                    credentials.get('redirect_uri', self.sf_config.redirect_uri),
+                    credentials.get('auth_url', self.sf_config.auth_url),
+                    credentials.get('token_url', self.sf_config.token_url)
                 )
-
-                print(f"Please go to {authorization_url} and authorize access.")
-                authorization_response = input("Enter the full callback URL: ")
-
-                try:
-                    # Exchange authorization code for token with PKCE verifier
-                    token = oauth.fetch_token(
-                        token_url,
-                        authorization_response=authorization_response,
-                        client_secret=client_secret,
-                        code_verifier=code_verifier,
-                        include_client_id=True
-                    )
-
-                    self.sf = Salesforce(
-                        instance_url=token['instance_url'],
-                        session_id=token['access_token'],
-                        version=version
-                    )
-                    self.logger.info("Successfully connected to Salesforce using OAuth2")
-
-                except Warning as w:
-                    # Handle scope change warning but continue if we got the token
-                    self.logger.warning(f"Scope warning: {str(w)}")
-                    if not oauth.token:
-                        raise
-                    self.sf = Salesforce(
-                        instance_url=oauth.token['instance_url'],
-                        session_id=oauth.token['access_token'],
-                        version=version
-                    )
-                    self.logger.info("Successfully connected despite scope warning")
-
-                # Save the new token
-                self.token_manager.set_token(token)
-                
-            except Exception as e:
-                self.logger.error(f"Failed to authenticate using OAuth2: {str(e)}")
-                raise
-        # Direct credentials authentication
-        elif username and password and security_token:
-            self.logger.info("Using direct credentials for authentication")
-            try:
-                self.sf = Salesforce(
-                    username=username,
-                    password=password,
-                    security_token=security_token,
-                    domain=domain,
-                    version=version
+            elif self.sf_config.auth_method == 'password':
+                self._handle_password_auth(
+                    credentials.get('username', self.sf_config.username),
+                    credentials.get('password', self.sf_config.password),
+                    credentials.get('security_token', self.sf_config.security_token),
+                    credentials.get('domain', self.sf_config.domain)
                 )
-                self.logger.info("Successfully connected using direct credentials")
-            except Exception as e:
-                self.logger.error(f"Failed to connect to Salesforce: {str(e)}")
-                raise
         else:
-            raise ValueError(
-                "Must provide either:\n"
-                "1. OAuth2 credentials (client_id, client_secret, token_url) with existing valid token, or\n"
-                "2. Full OAuth2 parameters for new authentication (client_id, client_secret, redirect_uri, auth_url, token_url), or\n"
-                "3. Direct credentials (username, password, security_token)"
-            )
+            # Use direct configuration if no credentials from secrets
+            if self.sf_config.auth_method == 'oauth':
+                if not all([self.sf_config.client_id, self.sf_config.client_secret, self.sf_config.token_url]):
+                    raise ValueError("OAuth2 requires client_id, client_secret, and token_url")
+                
+                self.token_manager = TokenManager(
+                    client_id=self.sf_config.client_id,
+                    client_secret=self.sf_config.client_secret,
+                    token_url=self.sf_config.token_url
+                )
+                
+                # Handle OAuth PKCE flow
+                if not all([self.sf_config.redirect_uri, self.sf_config.auth_url]):
+                    raise ValueError("OAuth2 PKCE requires redirect_uri and auth_url for authentication")
+                
+                self._handle_oauth_pkce_auth(
+                    self.sf_config.client_id,
+                    self.sf_config.client_secret,
+                    self.sf_config.redirect_uri,
+                    self.sf_config.auth_url,
+                    self.sf_config.token_url
+                )
+            elif self.sf_config.auth_method == 'password':
+                if not all([self.sf_config.username, self.sf_config.password, self.sf_config.security_token]):
+                    raise ValueError("Password auth requires username, password, and security_token")
+                self._handle_password_auth(
+                    self.sf_config.username,
+                    self.sf_config.password,
+                    self.sf_config.security_token,
+                    self.sf_config.domain
+                )
+            elif self.sf_config.auth_method == 'jwt_cert':
+                if not all([self.sf_config.client_id, self.sf_config.username]) or \
+                   not (self.sf_config.private_key or self.sf_config.private_key_path):
+                    raise ValueError("JWT cert auth requires client_id, username, and either private_key or private_key_path")
+                self._handle_jwt_cert_auth(
+                    self.sf_config.client_id,
+                    self.sf_config.username,
+                    self.sf_config.private_key,
+                    self.sf_config.private_key_path
+                )
+            elif self.sf_config.auth_method == 'jwt_secret':
+                raise ValueError("JWT secret auth requires credentials to be provided")
+
+        # Initialize DuckDB connection if Spark is not available
+        self.duckdb_conn = None
+        if self.proc_config.require_duckdb:
+            try:
+                duckdb = importlib.import_module('duckdb')
+                self.duckdb_conn = duckdb.connect(database=':memory:')
+                self.duckdb_conn.execute(f"SET memory_limit='{self.proc_config.duckdb_memory_limit}'")
+                self.duckdb_conn.execute("SET threads TO 4")
+                self.logger.info("Successfully initialized DuckDB connection")
+            except ImportError:
+                self.logger.error("DuckDB not installed. Please install with: pip install duckdb")
+                if self.proc_config.require_duckdb:
+                    raise
+            except Exception as e:
+                self.logger.error(f"Failed to initialize DuckDB: {str(e)}")
+                if self.proc_config.require_duckdb:
+                    raise
+
+
+        # Initialize extractor and loader only after sf is initialized
+        if self.sf is None:
+            raise ValueError("Failed to initialize Salesforce connection")
 
         self.extractor = DataExtractor(self.sf, self.spark, self.cache, self.logger)
         self.loader = DataLoader(self.sf, self.logger)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Explicitly close resources."""
+        if hasattr(self, 'duckdb_conn') and self.duckdb_conn:
+            self.duckdb_conn.close()
+            self.duckdb_conn = None
+        if hasattr(self, 'spark') and self.spark:
+            self.spark.stop()
+            self.spark = None
+        if hasattr(self, 'sf'):
+            self.sf = None  # Release Salesforce connection
+        if hasattr(self, 'token_manager'):
+            self.token_manager = None  # Release token manager
 
     def _ensure_valid_connection(self):
         """Ensure connection is valid, refreshing token if necessary."""
@@ -276,14 +224,113 @@ class ScalableSalesforceConnector:
             self.sf = Salesforce(
                 instance_url=token['instance_url'],
                 session_id=token['access_token'],
-                version=self.sf.version
+                version=self.version
             )
 
-    def extract_data(self, query: str, partition_field: str = None, 
-                    num_partitions: int = 10):
-        """Extract data with automatic token refresh."""
-        self._ensure_valid_connection()
-        return self.extractor.extract_data(query, partition_field, num_partitions)
+    def extract_data(
+        self, 
+        query: str, 
+        partition_field: Optional[str] = None,
+        num_partitions: int = 10,
+        output_format: Literal['auto', 'spark', 'duckdb', 'dict', 'dynamicframe'] = 'auto'
+    ) -> Union[List[Dict[str, Any]], 'SparkDataFrame', 'DynamicFrame', 'duckdb.DuckDBPyRelation']:
+        """Extract data with automatic format conversion based on context."""
+        try:
+            self._ensure_valid_connection()
+            
+            # Use DataExtractor for extraction
+            raw_data = self.extractor.extract_data(
+                query=query,
+                partition_field=partition_field,
+                num_partitions=num_partitions
+            )
+
+            # Determine output format
+            if output_format == 'auto':
+                if hasattr(self, 'proc_config') and self.proc_config.glue_context:
+                    output_format = 'dynamicframe'
+                elif self.spark:
+                    output_format = 'spark'
+                elif self.duckdb_conn:
+                    output_format = 'duckdb'
+                else:
+                    output_format = 'dict'
+                    self.logger.info("No processing engine available. Returning dictionary.")
+
+            # Format-specific conversions
+            try:
+                if output_format == 'dict':
+                    return raw_data if isinstance(raw_data, list) else raw_data.collect()
+                
+                elif output_format == 'duckdb':
+                    if not self.duckdb_conn:
+                        raise RuntimeError("DuckDB connection not available. Set require_duckdb=True in ProcessingConfig")
+                    
+                    table_name = f"sf_data_{abs(hash(query))}"
+                    self.duckdb_conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+                    
+                    try:
+                        if self.spark:
+                            # Convert Spark DataFrame to pandas
+                            spark_df = raw_data if isinstance(raw_data, DataFrame) else self.spark.createDataFrame(raw_data)
+                            pandas_df = spark_df.toPandas()
+                        else:
+                            # Direct pandas conversion
+                            pd = importlib.import_module('pandas')
+                            records = raw_data if isinstance(raw_data, list) else raw_data.collect()
+                            pandas_df = pd.DataFrame.from_records(records)
+                        
+                        # Create DuckDB table from pandas DataFrame
+                        self.duckdb_conn.execute(
+                            f"CREATE TABLE {table_name} AS SELECT * FROM pandas_df"
+                        )
+                        return self.duckdb_conn.table(table_name)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to convert data to DuckDB table: {str(e)}")
+                        raise RuntimeError(f"Failed to convert to {output_format} format") from e
+                
+                elif output_format == 'spark':
+                    if not self.spark:
+                        raise RuntimeError("Spark session not available")
+                    return raw_data if isinstance(raw_data, DataFrame) else self.spark.createDataFrame(raw_data)
+                
+                elif output_format == 'dynamicframe':
+                    if not hasattr(self, 'proc_config') or not self.proc_config.glue_context:
+                        raise RuntimeError("Glue context not available")
+                    from awsglue.dynamicframe import DynamicFrame
+                    spark_df = raw_data if isinstance(raw_data, DataFrame) else self.spark.createDataFrame(raw_data)
+                    return DynamicFrame.fromDF(spark_df, self.proc_config.glue_context, "extracted_data")
+                
+                else:
+                    raise ValueError(f"Unsupported output format: {output_format}")
+
+            except Exception as e:
+                self.logger.error(f"Format conversion failed: {str(e)}")
+                raise RuntimeError(f"Failed to convert to {output_format} format") from e
+
+        except Exception as e:
+            self.logger.error(f"Data extraction failed: {str(e)}")
+            raise
+
+    def query_data(self, sql_query: str):
+        """
+        Execute SQL query on the extracted data using DuckDB.
+        
+        Args:
+            sql_query: SQL query to execute
+            
+        Returns:
+            DuckDB result relation
+        """
+        if self.duckdb_conn is None:
+            raise ValueError("DuckDB connection not initialized")
+        
+        try:
+            return self.duckdb_conn.execute(sql_query).fetch_df()
+        except Exception as e:
+            self.logger.error(f"DuckDB query failed: {str(e)}")
+            raise
 
     def load_data(self, object_name: str, data, operation: str = 'insert', 
                  batch_size: int = 10000):
@@ -460,3 +507,30 @@ class ScalableSalesforceConnector:
         except Exception as e:
             self.logger.error(f"Failed to connect using password authentication: {str(e)}")
             raise
+
+    def __del__(self):
+        """Cleanup resources."""
+        if hasattr(self, 'duckdb_conn') and self.duckdb_conn:
+            self.duckdb_conn.close()
+
+    def is_connected(self) -> bool:
+        """Check if the connection to Salesforce is active."""
+        try:
+            self.sf.query("SELECT Id FROM Account LIMIT 1")
+            return True
+        except Exception as e:
+            self.logger.debug(f"Connection check failed: {str(e)}")
+            return False
+
+    def _clean_salesforce_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean a Salesforce record by removing unwanted attributes."""
+        if isinstance(record, dict):
+            cleaned = {}
+            for key, value in record.items():
+                if key not in ['attributes']:  # Skip Salesforce metadata
+                    if isinstance(value, dict):
+                        cleaned[key] = self._clean_salesforce_record(value)
+                    else:
+                        cleaned[key] = value
+            return cleaned
+        return record
